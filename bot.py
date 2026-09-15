@@ -30,12 +30,13 @@ class CallForm(StatesGroup):
     odometer_start = State()
     fuel_start = State()
     number = State()
+    from_place = State()
     address = State()
+    arrived = State()
     km_to = State()
     patient_taken = State()
     hospital = State()
     km_from = State()
-    time_on_scene = State()
     odometer_end = State()
     fuel_end = State()
     refuel = State()
@@ -201,30 +202,48 @@ async def shift_fuel_end(msg: types.Message, state: FSMContext):
 @dp.message_handler(lambda m: m.text == "🚑 Новый вызов")
 async def new_call(msg: types.Message):
     data = load_data()
-    data["current_call"] = {"accepted": now_orenburg().strftime("%H:%M")}
+    accepted = now_orenburg().strftime("%H:%M")
+    data["current_call"] = {"accepted": accepted}
     save_data(data)
     await CallForm.number.set()
-    await msg.answer("Введите номер вызова:")
+    await msg.answer(f"🕐 Время принятия: {accepted}\n\nВведите номер вызова:")
 
 @dp.message_handler(state=CallForm.number)
 async def call_number(msg: types.Message, state: FSMContext):
     data = load_data()
     data["current_call"]["number"] = msg.text
     save_data(data)
+    await CallForm.from_place.set()
+    await msg.answer("🚗 Откуда выезжаете? (место отправления):")
+
+@dp.message_handler(state=CallForm.from_place)
+async def call_from(msg: types.Message, state: FSMContext):
+    data = load_data()
+    data["current_call"]["from_place"] = msg.text
+    save_data(data)
     await CallForm.address.set()
-    await msg.answer("Введите адрес вызова (откуда):")
+    await msg.answer("📍 Куда едете? (адрес вызова):")
 
 @dp.message_handler(state=CallForm.address)
 async def call_address(msg: types.Message, state: FSMContext):
     data = load_data()
     data["current_call"]["address"] = msg.text
     save_data(data)
-    yandex_link = f"https://yandex.ru/maps/?text={msg.text}, Оренбург"
+    await CallForm.arrived.set()
+    await msg.answer("🕐 Время прибытия на адрес? (ЧЧ:ММ) или «-»:")
+
+@dp.message_handler(state=CallForm.arrived)
+async def call_arrived(msg: types.Message, state: FSMContext):
+    data = load_data()
+    data["current_call"]["arrived"] = msg.text if msg.text != "-" else None
+    save_data(data)
+    addr = data["current_call"]["address"]
+    yandex_link = f"https://yandex.ru/maps/?text={addr}, Оренбург"
+    await CallForm.km_to.set()
     await msg.answer(
         f"🗺️ Маршрут: {yandex_link}\n\n"
-        f"Сколько км до адреса? (число)"
+        f"📏 Сколько км до адреса? (по картам):"
     )
-    await CallForm.km_to.set()
 
 @dp.message_handler(state=CallForm.km_to)
 async def call_km_to(msg: types.Message, state: FSMContext):
@@ -236,7 +255,7 @@ async def call_km_to(msg: types.Message, state: FSMContext):
     data["current_call"]["km_to"] = km
     save_data(data)
     await CallForm.patient_taken.set()
-    await msg.answer("Пациента взяли? (Да / Нет)", reply_markup=yesno_kb())
+    await msg.answer("👤 Пациента взяли? (Да / Нет)", reply_markup=yesno_kb())
 
 @dp.message_handler(state=CallForm.patient_taken)
 async def call_patient(msg: types.Message, state: FSMContext):
@@ -248,10 +267,9 @@ async def call_patient(msg: types.Message, state: FSMContext):
     save_data(data)
     if ans == "да":
         await CallForm.hospital.set()
-        await msg.answer("Куда везёте пациента? (название больницы):")
+        await msg.answer("🏥 Куда везёте пациента? (название больницы):")
     else:
-        await CallForm.time_on_scene.set()
-        await msg.answer("Время прибытия на адрес? (ЧЧ:ММ) или «-»", reply_markup=types.ReplyKeyboardRemove())
+        await finish_call(msg, state, data)
 
 @dp.message_handler(state=CallForm.hospital)
 async def call_hospital(msg: types.Message, state: FSMContext):
@@ -259,7 +277,7 @@ async def call_hospital(msg: types.Message, state: FSMContext):
     data["current_call"]["hospital"] = msg.text
     save_data(data)
     await CallForm.km_from.set()
-    await msg.answer("Сколько км до больницы? (число)")
+    await msg.answer("📏 Сколько км до больницы? (число):")
 
 @dp.message_handler(state=CallForm.km_from)
 async def call_km_from(msg: types.Message, state: FSMContext):
@@ -270,14 +288,10 @@ async def call_km_from(msg: types.Message, state: FSMContext):
     data = load_data()
     data["current_call"]["km_from"] = km
     save_data(data)
-    await CallForm.time_on_scene.set()
-    await msg.answer("Время прибытия на адрес? (ЧЧ:ММ) или «-»")
+    await finish_call(msg, state, data)
 
-@dp.message_handler(state=CallForm.time_on_scene)
-async def call_finish(msg: types.Message, state: FSMContext):
-    data = load_data()
+async def finish_call(msg: types.Message, state: FSMContext, data):
     c = data["current_call"]
-    c["arrived"] = msg.text if msg.text != "-" else None
     km_from = c.get("km_from", 0)
     total_km = c["km_to"] + km_from
     spent = calc_fuel(total_km, data)
@@ -289,13 +303,18 @@ async def call_finish(msg: types.Message, state: FSMContext):
     save_data(data)
     await state.finish()
 
-    route = c["address"] + (" → " + c["hospital"] if c.get("hospital") else " (без доставки)")
+    route = c.get("from_place", "—") + " → " + c["address"]
+    if c.get("hospital"):
+        route += " → " + c["hospital"]
+    else:
+        route += " (без доставки)"
     odo_now = (data.get("odometer_start") or 0) + sum(x["total_km"] for x in data["calls"])
     norm = data["settings"]["fuel_consumption"]
 
     await msg.answer(
         f"✅ Вызов №{c['number']} закрыт\n"
         f"📍 {route}\n"
+        f"🕐 Принят: {c.get('accepted','—')} | На адресе: {c.get('arrived') or '—'}\n"
         f"📏 Пробег: {total_km:.1f} км\n"
         f"🛢 Спидометр: {odo_now:.0f} км\n"
         f"⛽ Расход по норме ({norm} л/100км): {spent:.2f} л\n"
@@ -325,9 +344,10 @@ async def refuel_save(msg: types.Message, state: FSMContext):
 async def on_scene(msg: types.Message):
     data = load_data()
     if data.get("current_call"):
-        data["current_call"]["arrived"] = now_orenburg().strftime("%H:%M")
+        t = now_orenburg().strftime("%H:%M")
+        data["current_call"]["arrived"] = t
         save_data(data)
-        await msg.answer(f"🏥 Время прибытия: {data['current_call']['arrived']} (Оренбург)")
+        await msg.answer(f"🏥 Время прибытия: {t} (Оренбург)")
     else:
         await msg.answer("Нет активного вызова.")
 
@@ -378,11 +398,17 @@ async def show_summary(msg: types.Message):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 <b>ДЛЯ ПУТЕВОГО ЛИСТА:</b>\n"
     )
+    if odo_start is not None:
+        text += f"• Одометр начало: {odo_start:.0f} км\n"
+    if odo_end is not None:
+        text += f"• Одометр конец: {odo_end:.0f} км\n"
     if real_km is not None:
         text += f"• Пробег: {real_km:.1f} км\n"
     else:
         text += f"• Пробег: {total_km:.1f} км\n"
     text += (
+        f"• Остаток при выезде: {fuel_start:.1f} л\n"
+        f"• Заправок: +{refueled:.1f} л\n"
         f"• Расход по норме: {norm_fuel:.2f} л\n"
         f"• Фактический расход: {fact_fuel:.2f} л\n"
         f"• Остаток в баке: {fuel_end:.1f} л\n"
@@ -401,7 +427,11 @@ async def show_summary(msg: types.Message):
             delivery = f" | Подача: {minutes} мин {mark}"
         except Exception:
             pass
-        route = c["address"] + (" → " + c["hospital"] if c.get("hospital") else " (без доставки)")
+        route = c.get("from_place", "—") + " → " + c["address"]
+        if c.get("hospital"):
+            route += " → " + c["hospital"]
+        else:
+            route += " (без доставки)"
         text += f"• №{c['number']} — {route}\n"
         text += f"   Принят: {accepted} | На адресе: {arrived}{delivery}\n"
         text += f"   {c['total_km']:.1f} км, {c['fuel_spent']:.2f} л\n"
