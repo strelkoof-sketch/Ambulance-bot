@@ -177,6 +177,7 @@ async def call_finish(msg: types.Message, state: FSMContext):
     await state.finish()
     await msg.answer(
         f"✅ Вызов №{c['number']} закрыт\n"
+        f"📍 {c['address']} → {c['hospital']}\n"
         f"📏 Пробег: {total_km:.1f} км\n"
         f"⛽ Расход: {spent:.2f} л\n"
         f"🛢 Остаток: {fuel_status(data)}",
@@ -223,7 +224,8 @@ async def summary(msg: types.Message):
         f"🛢 Остаток: {fuel_status(data)}\n\n"
     )
     for c in calls:
-        text += f"• №{c['number']} — {c['total_km']:.1f} км, {c['fuel_spent']:.2f} л\n"
+        text += f"• №{c['number']} — {c['address']} → {c['hospital']}\n"
+        text += f"   {c['total_km']:.1f} км, {c['fuel_spent']:.2f} л\n"
     await msg.answer(text, parse_mode="HTML")
 
 if __name__ == "__main__":
