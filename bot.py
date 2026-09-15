@@ -22,12 +22,13 @@ def now_orenburg():
 # НОРМА РАСХОДА — меняйте здесь (л/100 км)
 DEFAULT_SETTINGS = {
     "fuel_consumption": 13.5,
-    "tank_volume": 60,
     "fuel_price": 62.0,
     "norm_minutes": 20
 }
 
 class CallForm(StatesGroup):
+    odometer_start = State()
+    fuel_start = State()
     number = State()
     address = State()
     km_to = State()
@@ -35,17 +36,21 @@ class CallForm(StatesGroup):
     hospital = State()
     km_from = State()
     time_on_scene = State()
-    odometer_start = State()
     odometer_end = State()
+    fuel_end = State()
     refuel = State()
 
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {
             "settings": DEFAULT_SETTINGS.copy(),
-            "fuel_left": DEFAULT_SETTINGS["tank_volume"] * 0.75,
+            "fuel_left": 0.0,
+            "fuel_start": 0.0,
+            "fuel_end": 0.0,
+            "refueled": 0.0,
             "shift_start": None,
             "odometer_start": None,
+            "odometer_end": None,
             "calls": [],
             "current_call": None
         }
@@ -74,26 +79,21 @@ def yesno_kb():
 def calc_fuel(km, data):
     return km * data["settings"]["fuel_consumption"] / 100
 
-def fuel_status(data):
-    left = data["fuel_left"]
-    tank = data["settings"]["tank_volume"]
-    percent = left / tank * 100
+def fuel_status(left):
     if left < 10:
         flag = "🔴 СРОЧНО ЗАПРАВИТЬСЯ"
     elif left < 20:
         flag = "🟡 низкий уровень"
     else:
         flag = "🟢 ок"
-    return f"{left:.1f} л ({percent:.0f}%) {flag}"
+    return f"{left:.1f} л {flag}"
 
 @dp.message_handler(commands=["start"])
 async def start(msg: types.Message):
-    data = load_data()
-    s = data["settings"]
+    s = DEFAULT_SETTINGS
     await msg.answer(
         "🚑 <b>Помощник водителя скорой</b>\n\n"
         f"📏 Норма расхода: {s['fuel_consumption']} л/100 км\n"
-        f"🛢 Бак: {s['tank_volume']} л\n"
         f"⏱ Норматив подачи: {s['norm_minutes']} мин\n\n"
         "Начните со «🌅 Старт смены».",
         parse_mode="HTML",
@@ -106,7 +106,7 @@ async def status(msg: types.Message):
     s = data["settings"]
     odo = data.get("odometer_start") or "—"
     await msg.answer(
-        f"⛽ Топливо: {fuel_status(data)}\n"
+        f"⛽ Топливо: {fuel_status(data['fuel_left'])}\n"
         f"📏 Норма расхода: {s['fuel_consumption']} л/100км\n"
         f"🛢 Спидометр на старте: {odo}\n"
         f"📋 Вызовов: {len(data['calls'])}"
@@ -126,17 +126,35 @@ async def shift_odometer(msg: types.Message, state: FSMContext):
     except ValueError:
         return await msg.answer("Введите число, например 125430")
     data = load_data()
+    data["odometer_start"] = odo
+    save_data(data)
+    await CallForm.fuel_start.set()
+    await msg.answer("⛽ Сколько сейчас топлива в баке? (л):")
+
+@dp.message_handler(state=CallForm.fuel_start)
+async def shift_fuel(msg: types.Message, state: FSMContext):
+    text = msg.text.replace(" ", "").replace(",", ".")
+    try:
+        fuel = float(text)
+    except ValueError:
+        return await msg.answer("Введите число, например 52.5")
+    data = load_data()
     s = data["settings"]
     data["shift_start"] = now_orenburg().strftime("%d.%m %H:%M")
-    data["odometer_start"] = odo
+    data["fuel_start"] = fuel
+    data["fuel_left"] = fuel
+    data["refueled"] = 0.0
     data["calls"] = []
+    data["odometer_end"] = None
+    data["fuel_end"] = None
     save_data(data)
     await state.finish()
     await msg.answer(
         f"🌅 Смена начата: {data['shift_start']} (Оренбург)\n"
-        f"🛢 Спидометр: {odo:.0f} км\n"
-        f"⛽ Топливо: {fuel_status(data)}\n"
-        f"📏 Норма расхода: {s['fuel_consumption']} л/100 км",
+        f"🛢 Спидометр: {data['odometer_start']:.0f} км\n"
+        f"⛽ Остаток топлива: {fuel:.1f} л\n"
+        f"📏 Норма расхода: {s['fuel_consumption']} л/100 км\n\n"
+        f"Жду первый вызов.",
         reply_markup=main_kb()
     )
 
@@ -155,13 +173,26 @@ async def shift_odometer_end(msg: types.Message, state: FSMContext):
         return await msg.answer("Введите число, например 125512")
     data = load_data()
     odo_start = data.get("odometer_start")
-    real_km = (odo_end - odo_start) if odo_start else None
-    if real_km is not None and real_km < 0:
+    if odo_start is not None and odo_end < odo_start:
         return await msg.answer("Спидометр на конец меньше, чем на начало. Проверьте число.")
     data["odometer_end"] = odo_end
     save_data(data)
+    await CallForm.fuel_end.set()
+    await msg.answer("⛽ Сколько топлива осталось в баке? (л):")
+
+@dp.message_handler(state=CallForm.fuel_end)
+async def shift_fuel_end(msg: types.Message, state: FSMContext):
+    text = msg.text.replace(" ", "").replace(",", ".")
+    try:
+        fuel_end = float(text)
+    except ValueError:
+        return await msg.answer("Введите число, например 40.0")
+    data = load_data()
+    data["fuel_end"] = fuel_end
+    data["fuel_left"] = fuel_end
+    save_data(data)
     await state.finish()
-    await show_summary(msg, odo_end=odo_end, real_km=real_km)
+    await show_summary(msg)
     data = load_data()
     data["shift_start"] = None
     save_data(data)
@@ -188,7 +219,6 @@ async def call_address(msg: types.Message, state: FSMContext):
     data = load_data()
     data["current_call"]["address"] = msg.text
     save_data(data)
-    # Ссылка на Яндекс.Карты для маршрута
     yandex_link = f"https://yandex.ru/maps/?text={msg.text}, Оренбург"
     await msg.answer(
         f"🗺️ Маршрут: {yandex_link}\n\n"
@@ -269,7 +299,7 @@ async def call_finish(msg: types.Message, state: FSMContext):
         f"📏 Пробег: {total_km:.1f} км\n"
         f"🛢 Спидометр: {odo_now:.0f} км\n"
         f"⛽ Расход по норме ({norm} л/100км): {spent:.2f} л\n"
-        f"🛢 Остаток: {fuel_status(data)}",
+        f"🛢 Остаток: {fuel_status(data['fuel_left'])}",
         reply_markup=main_kb()
     )
 
@@ -286,11 +316,10 @@ async def refuel_save(msg: types.Message, state: FSMContext):
         return await msg.answer("Введите число, например 40")
     data = load_data()
     data["fuel_left"] += liters
-    if data["fuel_left"] > data["settings"]["tank_volume"]:
-        data["fuel_left"] = data["settings"]["tank_volume"]
+    data["refueled"] = data.get("refueled", 0.0) + liters
     save_data(data)
     await state.finish()
-    await msg.answer(f"⛽ Заправлено: {liters} л\n🛢 В баке: {fuel_status(data)}", reply_markup=main_kb())
+    await msg.answer(f"⛽ Заправлено: {liters} л\n🛢 В баке: {fuel_status(data['fuel_left'])}", reply_markup=main_kb())
 
 @dp.message_handler(lambda m: m.text == "🏥 На адресе")
 async def on_scene(msg: types.Message):
@@ -303,37 +332,63 @@ async def on_scene(msg: types.Message):
         await msg.answer("Нет активного вызова.")
 
 # ========== ИТОГ СМЕНЫ ==========
-async def show_summary(msg: types.Message, odo_end=None, real_km=None):
+async def show_summary(msg: types.Message):
     data = load_data()
     calls = data["calls"]
     if not calls:
         return await msg.answer("За смену ещё нет вызовов.")
+
     total_km = sum(c["total_km"] for c in calls)
-    total_fuel = sum(c["fuel_spent"] for c in calls)
+    norm_fuel = sum(c["fuel_spent"] for c in calls)
     norm = data["settings"]["fuel_consumption"]
+
     odo_start = data.get("odometer_start")
-    odo_end = odo_end or data.get("odometer_end")
-    if odo_end is None and odo_start is not None:
-        odo_end = odo_start + total_km
-    if real_km is None and odo_start is not None and odo_end is not None:
-        real_km = odo_end - odo_start
+    odo_end = data.get("odometer_end")
+    real_km = (odo_end - odo_start) if (odo_start is not None and odo_end is not None) else None
+
+    fuel_start = data.get("fuel_start", 0.0)
+    fuel_end = data.get("fuel_end", 0.0)
+    refueled = data.get("refueled", 0.0)
+    fact_fuel = (fuel_start + refueled) - fuel_end
 
     text = (
         f"📊 <b>ИТОГ СМЕНЫ (Оренбург)</b>\n"
-        f"🌅 Начало: {data['shift_start'] or '—'}\n"
+        f"🌅 Начало: {data['shift_start'] or '—'}\n\n"
+        f"🛢 <b>ОДОМЕТР:</b>\n"
     )
     if odo_start is not None:
-        text += f"🛢 Спидометр начало: {odo_start:.0f} км\n"
+        text += f"• Начало: {odo_start:.0f} км\n"
     if odo_end is not None:
-        text += f"🛢 Спидометр конец: {odo_end:.0f} км\n"
+        text += f"• Конец: {odo_end:.0f} км\n"
     if real_km is not None:
-        text += f"📏 Пробег по спидометру: {real_km:.1f} км\n"
+        text += f"• Пробег по спидометру: {real_km:.1f} км\n"
+    text += f"• Пробег по вызовам: {total_km:.1f} км\n\n"
+
     text += (
-        f"📏 Пробег по вызовам: {total_km:.1f} км\n"
-        f"🚑 Вызовов: {len(calls)}\n"
-        f"⛽ Расход по норме ({norm} л/100км): {total_fuel:.2f} л\n"
-        f"🛢 Остаток: {fuel_status(data)}\n\n"
+        f"⛽ <b>ТОПЛИВО:</b>\n"
+        f"• На старте: {fuel_start:.1f} л\n"
+        f"• Заправок: +{refueled:.1f} л\n"
+        f"• На конце: {fuel_end:.1f} л\n"
+        f"• По норме ({norm} л/100км): {norm_fuel:.2f} л\n"
+        f"• Фактический расход: {fact_fuel:.2f} л\n\n"
+        f"🚑 Вызовов: {len(calls)}\n\n"
     )
+
+    text += (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 <b>ДЛЯ ПУТЕВОГО ЛИСТА:</b>\n"
+    )
+    if real_km is not None:
+        text += f"• Пробег: {real_km:.1f} км\n"
+    else:
+        text += f"• Пробег: {total_km:.1f} км\n"
+    text += (
+        f"• Расход по норме: {norm_fuel:.2f} л\n"
+        f"• Фактический расход: {fact_fuel:.2f} л\n"
+        f"• Остаток в баке: {fuel_end:.1f} л\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
     for c in calls:
         accepted = c.get("accepted", "—")
         arrived = c.get("arrived") or "—"
