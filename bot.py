@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -12,6 +12,12 @@ logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.environ.get("BOT_TOKEN")
 DATA_FILE = "shift_data.json"
+
+# Оренбург = UTC+5
+ORENBURG_TZ = timezone(timedelta(hours=5))
+
+def now_orenburg():
+    return datetime.now(ORENBURG_TZ)
 
 DEFAULT_SETTINGS = {
     "fuel_consumption": 13.5,
@@ -93,10 +99,10 @@ async def status(msg: types.Message):
 @dp.message_handler(lambda m: m.text == "🌅 Старт смены")
 async def shift_start(msg: types.Message):
     data = load_data()
-    data["shift_start"] = datetime.now().strftime("%d.%m %H:%M")
+    data["shift_start"] = now_orenburg().strftime("%d.%m %H:%M")
     data["calls"] = []
     save_data(data)
-    await msg.answer(f"🌅 Смена начата: {data['shift_start']}\n⛽ Топливо: {fuel_status(data)}")
+    await msg.answer(f"🌅 Смена начата: {data['shift_start']} (Оренбург)\n⛽ Топливо: {fuel_status(data)}")
 
 @dp.message_handler(lambda m: m.text == "🌙 Конец смены")
 async def shift_end(msg: types.Message):
@@ -108,7 +114,7 @@ async def shift_end(msg: types.Message):
 @dp.message_handler(lambda m: m.text == "🚑 Новый вызов")
 async def new_call(msg: types.Message):
     data = load_data()
-    data["current_call"] = {"accepted": datetime.now().strftime("%H:%M")}
+    data["current_call"] = {"accepted": now_orenburg().strftime("%H:%M")}
     save_data(data)
     await CallForm.number.set()
     await msg.answer("Введите номер вызова:")
@@ -205,7 +211,13 @@ async def refuel_save(msg: types.Message, state: FSMContext):
 
 @dp.message_handler(lambda m: m.text == "🏥 На адресе")
 async def on_scene(msg: types.Message):
-    await msg.answer("🏥 Отметьте время прибытия и продолжите ввод вызова.")
+    data = load_data()
+    if data["current_call"]:
+        data["current_call"]["arrived"] = now_orenburg().strftime("%H:%M")
+        save_data(data)
+        await msg.answer(f"🏥 Время прибытия зафиксировано: {data['current_call']['arrived']} (Оренбург)")
+    else:
+        await msg.answer("Нет активного вызова.")
 
 @dp.message_handler(lambda m: m.text == "📊 Итог смены")
 async def summary(msg: types.Message):
@@ -217,7 +229,7 @@ async def summary(msg: types.Message):
     total_fuel = sum(c["fuel_spent"] for c in calls)
     norm = data["settings"]["norm_minutes"]
     text = (
-        f"📊 <b>ИТОГ СМЕНЫ</b>\n"
+        f"📊 <b>ИТОГ СМЕНЫ (Оренбург)</b>\n"
         f"🌅 Начало: {data['shift_start'] or '—'}\n"
         f"🚑 Вызовов: {len(calls)}\n"
         f"📏 Пробег: {total_km:.1f} км\n"
