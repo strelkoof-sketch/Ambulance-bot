@@ -215,6 +215,7 @@ async def summary(msg: types.Message):
         return await msg.answer("За смену ещё нет вызовов.")
     total_km = sum(c["total_km"] for c in calls)
     total_fuel = sum(c["fuel_spent"] for c in calls)
+    norm = data["settings"]["norm_minutes"]
     text = (
         f"📊 <b>ИТОГ СМЕНЫ</b>\n"
         f"🌅 Начало: {data['shift_start'] or '—'}\n"
@@ -224,7 +225,19 @@ async def summary(msg: types.Message):
         f"🛢 Остаток: {fuel_status(data)}\n\n"
     )
     for c in calls:
+        accepted = c.get("accepted", "—")
+        arrived = c.get("arrived") or "—"
+        delivery = ""
+        try:
+            t1 = datetime.strptime(accepted, "%H:%M")
+            t2 = datetime.strptime(arrived, "%H:%M")
+            minutes = (t2 - t1).seconds // 60
+            mark = "⚠️" if minutes > norm else "✅"
+            delivery = f" | Подача: {minutes} мин {mark}"
+        except Exception:
+            pass
         text += f"• №{c['number']} — {c['address']} → {c['hospital']}\n"
+        text += f"   Принят: {accepted} | На адресе: {arrived}{delivery}\n"
         text += f"   {c['total_km']:.1f} км, {c['fuel_spent']:.2f} л\n"
     await msg.answer(text, parse_mode="HTML")
 
