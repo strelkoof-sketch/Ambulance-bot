@@ -19,7 +19,7 @@ def now_orenburg():
     return datetime.now(ORENBURG_TZ)
 
 DEFAULT_SETTINGS = {
-    "fuel_consumption": 13.5,
+    "fuel_consumption": 17.74,
     "fuel_price": 62.0,
     "norm_minutes": 20
 }
