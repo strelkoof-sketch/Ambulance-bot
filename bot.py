@@ -30,14 +30,13 @@ class CallForm(StatesGroup):
     number = State()
     from_place = State()
     address = State()
-    arrived = State()
     km_to = State()
     patient_taken = State()
     hospital = State()
     km_from = State()
     odometer_fact = State()
-    fuel_end = State()
     refuel = State()
+    cancel_km = State()
 
 def load_data():
     if not os.path.exists(DATA_FILE):
@@ -45,12 +44,13 @@ def load_data():
             "settings": DEFAULT_SETTINGS.copy(),
             "fuel_left": 0.0,
             "fuel_start": 0.0,
-            "fuel_end": 0.0,
             "refueled": 0.0,
             "shift_start": None,
             "odometer_start": None,
             "odometer_fact": None,
             "calls": [],
+            "cancelled": [],
+            "pending_km": 0,
             "current_call": None
         }
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -66,7 +66,8 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 def main_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("🚑 Новый вызов", "🏥 На адресе")
-    kb.add("⛽ Заправился", "📊 Итог смены")
+    kb.add("❌ Отмена вызова", "⛽ Заправился")
+    kb.add("📊 Итог смены")
     kb.add("🌅 Старт смены", "🌙 Конец смены")
     return kb
 
@@ -74,9 +75,6 @@ def yesno_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("Да", "Нет")
     return kb
-
-def calc_fuel(km, data):
-    return km * data["settings"]["fuel_consumption"] / 100
 
 def fuel_status(left):
     if left < 10:
@@ -104,12 +102,17 @@ async def status(msg: types.Message):
     data = load_data()
     s = data["settings"]
     odo = data.get("odometer_start") or "—"
-    await msg.answer(
+    pending = data.get("pending_km", 0)
+    text = (
         f"⛽ Топливо: {fuel_status(data['fuel_left'])}\n"
         f"📏 Норма расхода: {s['fuel_consumption']} л/100км\n"
         f"🛢 Спидометр на старте: {odo}\n"
-        f"📋 Вызовов: {len(data['calls'])}"
+        f"📋 Вызовов: {len(data['calls'])}\n"
+        f"❌ Отменённых: {len(data.get('cancelled', []))}"
     )
+    if pending > 0:
+        text += f"\n⏳ Отложенных км: {pending}"
+    await msg.answer(text)
 
 # ========== СТАРТ СМЕНЫ ==========
 @dp.message_handler(lambda m: m.text == "🌅 Старт смены")
@@ -144,8 +147,9 @@ async def shift_fuel(msg: types.Message, state: FSMContext):
     data["fuel_left"] = fuel
     data["refueled"] = 0.0
     data["calls"] = []
+    data["cancelled"] = []
+    data["pending_km"] = 0
     data["odometer_fact"] = None
-    data["fuel_end"] = None
     save_data(data)
     await state.finish()
     await msg.answer(
@@ -161,12 +165,15 @@ async def shift_fuel(msg: types.Message, state: FSMContext):
 @dp.message_handler(lambda m: m.text == "🌙 Конец смены")
 async def shift_end(msg: types.Message):
     data = load_data()
-    if not data["calls"]:
+    if not data["calls"] and not data.get("cancelled"):
         return await msg.answer("За смену ещё нет вызовов.")
     await CallForm.odometer_fact.set()
-    calc_end = (data.get("odometer_start") or 0) + sum(c["total_km"] for c in data["calls"])
+    calls_km = sum(c["total_km"] for c in data["calls"])
+    cancelled_km = sum(c["km"] for c in data.get("cancelled", []))
+    total_km = calls_km + cancelled_km + data.get("pending_km", 0)
+    calc_end = (data.get("odometer_start") or 0) + total_km
     await msg.answer(
-        f"📊 Расчётный одометр на конец: {calc_end:.0f} км\n\n"
+        f"📊 Расчётный одометр на конец: {calc_end} км\n\n"
         f"🛢 Введите фактическое показание спидометра (км):"
     )
 
@@ -188,14 +195,18 @@ async def shift_odometer_fact(msg: types.Message, state: FSMContext):
 async def new_call(msg: types.Message):
     data = load_data()
     accepted = now_orenburg().strftime("%H:%M")
-    last_point = ""
-    if data["calls"]:
-        last = data["calls"][-1]
-        last_point = last.get("hospital") or last.get("address") or ""
     data["current_call"] = {"accepted": accepted}
     save_data(data)
     await CallForm.number.set()
-    await msg.answer(f"🕐 Время принятия: {accepted}\n\nВведите номер вызова:")
+    pending = data.get("pending_km", 0)
+    if pending > 0:
+        await msg.answer(
+            f"🕐 Время принятия: {accepted}\n"
+            f"⏳ Отложенных км с отмены: {pending}\n\n"
+            f"Введите номер вызова:"
+        )
+    else:
+        await msg.answer(f"🕐 Время принятия: {accepted}\n\nВведите номер вызова:")
 
 @dp.message_handler(state=CallForm.number)
 async def call_number(msg: types.Message, state: FSMContext):
@@ -218,28 +229,34 @@ async def call_address(msg: types.Message, state: FSMContext):
     data = load_data()
     data["current_call"]["address"] = msg.text
     save_data(data)
-    await CallForm.arrived.set()
-    await msg.answer("🕐 Время прибытия на адрес? (ЧЧ:ММ) или «-»:")
+    await state.finish()
+    await msg.answer(
+        "🚑 Едете на вызов.\n"
+        "Когда прибудете — нажмите «🏥 На адресе».\n"
+        "Если отменят — нажмите «❌ Отмена вызова».",
+        reply_markup=main_kb()
+    )
 
-@dp.message_handler(state=CallForm.arrived)
-async def call_arrived(msg: types.Message, state: FSMContext):
+@dp.message_handler(lambda m: m.text == "🏥 На адресе")
+async def on_scene(msg: types.Message):
     data = load_data()
-    data["current_call"]["arrived"] = msg.text if msg.text != "-" else None
+    if not data.get("current_call"):
+        return await msg.answer("Нет активного вызова.")
+    t = now_orenburg().strftime("%H:%M")
+    data["current_call"]["arrived"] = t
     save_data(data)
-    addr = data["current_call"]["address"]
-    yandex_link = f"https://yandex.ru/maps/?text={addr}, Оренбург"
     await CallForm.km_to.set()
     await msg.answer(
-        f"🗺️ Маршрут: {yandex_link}\n\n"
-        f"📏 Сколько км до адреса? (по картам):"
+        f"🏥 Время прибытия: {t} (Оренбург)\n\n"
+        f"📏 Сколько км от точки А до точки Б? (по картам):"
     )
 
 @dp.message_handler(state=CallForm.km_to)
 async def call_km_to(msg: types.Message, state: FSMContext):
     try:
-        km = float(msg.text.replace(",", "."))
+        km = round(float(msg.text.replace(",", ".")))
     except ValueError:
-        return await msg.answer("Введите число, например 8.2")
+        return await msg.answer("Введите число, например 8")
     data = load_data()
     data["current_call"]["km_to"] = km
     save_data(data)
@@ -256,7 +273,7 @@ async def call_patient(msg: types.Message, state: FSMContext):
     save_data(data)
     if ans == "да":
         await CallForm.hospital.set()
-        await msg.answer("🏥 Куда везёте пациента? (название больницы):")
+        await msg.answer("🏥 Куда везёте пациента? (название больницы):", reply_markup=main_kb())
     else:
         await finish_call(msg, state, data)
 
@@ -271,9 +288,9 @@ async def call_hospital(msg: types.Message, state: FSMContext):
 @dp.message_handler(state=CallForm.km_from)
 async def call_km_from(msg: types.Message, state: FSMContext):
     try:
-        km = float(msg.text.replace(",", "."))
+        km = round(float(msg.text.replace(",", ".")))
     except ValueError:
-        return await msg.answer("Введите число, например 5.4")
+        return await msg.answer("Введите число, например 5")
     data = load_data()
     data["current_call"]["km_from"] = km
     save_data(data)
@@ -282,12 +299,17 @@ async def call_km_from(msg: types.Message, state: FSMContext):
 async def finish_call(msg: types.Message, state: FSMContext, data):
     c = data["current_call"]
     km_from = c.get("km_from", 0)
-    total_km = c["km_to"] + km_from
-    spent = calc_fuel(total_km, data)
+    pending = data.get("pending_km", 0)
+    own_km = c["km_to"] + km_from
+    total_km = own_km + pending
+    spent = round(total_km * data["settings"]["fuel_consumption"] / 100, 2)
     data["fuel_left"] -= spent
     c["total_km"] = total_km
+    c["own_km"] = own_km
+    c["pending_used"] = pending
     c["fuel_spent"] = spent
     c["adjusted_km"] = total_km
+    data["pending_km"] = 0
     data["calls"].append(c)
     data["current_call"] = None
     save_data(data)
@@ -298,17 +320,63 @@ async def finish_call(msg: types.Message, state: FSMContext, data):
         route += " → " + c["hospital"]
     else:
         route += " (без доставки)"
-    odo_now = (data.get("odometer_start") or 0) + sum(x["adjusted_km"] for x in data["calls"])
+    odo_now = (data.get("odometer_start") or 0) + sum(x["adjusted_km"] for x in data["calls"]) + sum(x["km"] for x in data.get("cancelled", []))
     norm = data["settings"]["fuel_consumption"]
+
+    pending_info = ""
+    if pending > 0:
+        pending_info = f"\n⏳ Включено с отмены: {pending} км\n"
 
     await msg.answer(
         f"✅ Вызов №{c['number']} закрыт\n"
         f"📍 {route}\n"
         f"🕐 Принят: {c.get('accepted','—')} | На адресе: {c.get('arrived') or '—'}\n"
-        f"📏 Пробег: {total_km:.1f} км\n"
+        f"📏 Пробег: {total_km} км{pending_info}\n"
         f"🛢 Спидометр (расчёт): {odo_now:.0f} км\n"
         f"⛽ Расход по норме ({norm} л/100км): {spent:.2f} л\n"
         f"🛢 Остаток: {fuel_status(data['fuel_left'])}",
+        reply_markup=main_kb()
+    )
+
+# ========== ОТМЕНА ВЫЗОВА ==========
+@dp.message_handler(lambda m: m.text == "❌ Отмена вызова")
+async def cancel_start(msg: types.Message):
+    data = load_data()
+    if not data.get("current_call"):
+        return await msg.answer("Нет активного вызова.")
+    await CallForm.cancel_km.set()
+    await msg.answer("❌ Сколько км проехали до отмены?")
+
+@dp.message_handler(state=CallForm.cancel_km)
+async def cancel_save(msg: types.Message, state: FSMContext):
+    try:
+        km = round(float(msg.text.replace(",", ".")))
+    except ValueError:
+        return await msg.answer("Введите число, например 5")
+    data = load_data()
+    c = data["current_call"]
+    spent = round(km * data["settings"]["fuel_consumption"] / 100, 2)
+    data["fuel_left"] -= spent
+    cancelled = {
+        "number": c.get("number", "—"),
+        "address": c.get("address", "—"),
+        "from_place": c.get("from_place", "—"),
+        "accepted": c.get("accepted", "—"),
+        "km": km,
+        "fuel_spent": spent
+    }
+    data["cancelled"].append(cancelled)
+    data["pending_km"] = data.get("pending_km", 0) + km
+    data["current_call"] = None
+    save_data(data)
+    await state.finish()
+    await msg.answer(
+        f"❌ Вызов №{cancelled['number']} отменён\n"
+        f"📍 {cancelled['from_place']} → {cancelled['address']}\n"
+        f"📏 Пробег: {km} км (пойдёт в следующий вызов)\n"
+        f"⛽ Расход: {spent:.2f} л\n"
+        f"🛢 Остаток: {fuel_status(data['fuel_left'])}\n\n"
+        f"⏳ Отложено для следующего вызова: {data['pending_km']} км",
         reply_markup=main_kb()
     )
 
@@ -330,22 +398,12 @@ async def refuel_save(msg: types.Message, state: FSMContext):
     await state.finish()
     await msg.answer(f"⛽ Заправлено: {liters} л\n🛢 В баке: {fuel_status(data['fuel_left'])}", reply_markup=main_kb())
 
-@dp.message_handler(lambda m: m.text == "🏥 На адресе")
-async def on_scene(msg: types.Message):
-    data = load_data()
-    if data.get("current_call"):
-        t = now_orenburg().strftime("%H:%M")
-        data["current_call"]["arrived"] = t
-        save_data(data)
-        await msg.answer(f"🏥 Время прибытия: {t} (Оренбург)")
-    else:
-        await msg.answer("Нет активного вызова.")
-
-# ========== ИТОГ СМЕНЫ С ПОДГОНКОЙ ==========
+# ========== ИТОГ СМЕНЫ ==========
 async def show_summary(msg: types.Message):
     data = load_data()
     calls = data["calls"]
-    if not calls:
+    cancelled = data.get("cancelled", [])
+    if not calls and not cancelled:
         return await msg.answer("За смену ещё нет вызовов.")
 
     norm = data["settings"]["fuel_consumption"]
@@ -353,32 +411,36 @@ async def show_summary(msg: types.Message):
     odo_fact = data.get("odometer_fact")
     fuel_start = data.get("fuel_start", 0.0)
     refueled = data.get("refueled", 0.0)
+    pending = data.get("pending_km", 0)
 
-    calc_total_km = sum(c["total_km"] for c in calls)
+    calls_km = sum(c["total_km"] for c in calls)
+    cancelled_km = sum(c["km"] for c in cancelled)
+    calc_total_km = calls_km + cancelled_km + pending
     calc_end = (odo_start or 0) + calc_total_km
 
-    # Подгонка, если введён фактический одометр
-    diff_km = 0.0
+    diff_km = 0
     fact_total_km = calc_total_km
     if odo_fact is not None and odo_start is not None:
-        fact_total_km = odo_fact - odo_start
+        fact_total_km = round(odo_fact - odo_start)
         diff_km = fact_total_km - calc_total_km
-        if calc_total_km > 0 and abs(diff_km) > 0.01:
-            # пропорциональная подгонка
-            for c in calls:
-                k = c["total_km"] / calc_total_km
-                c["adjusted_km"] = c["total_km"] + diff_km * k
+        if calls_km > 0 and diff_km != 0:
+            accumulated = cancelled_km + pending
+            for i, c in enumerate(calls):
+                if i == len(calls) - 1:
+                    new_km = fact_total_km - accumulated
+                else:
+                    k = c["total_km"] / calls_km
+                    new_km = round(c["total_km"] + diff_km * k)
+                c["adjusted_km"] = new_km
+                accumulated += new_km
         else:
             for c in calls:
                 c["adjusted_km"] = c["total_km"]
 
-    # пересчёт топлива от скорректированного пробега
     for c in calls:
-        c["adjusted_fuel"] = c["adjusted_km"] * norm / 100
-    adj_norm_fuel = sum(c["adjusted_fuel"] for c in calls)
-    fact_fuel = (fuel_start + refueled) - (fuel_start + refueled - adj_norm_fuel)  # = adj_norm_fuel
-    # фактический остаток = старт + заправки - расход
-    fuel_end_calc = fuel_start + refueled - adj_norm_fuel
+        c["adjusted_fuel"] = round(c["adjusted_km"] * norm / 100, 2)
+    adj_norm_fuel = round(sum(c["adjusted_fuel"] for c in calls) + sum(c["fuel_spent"] for c in cancelled), 2)
+    fuel_end_calc = round(fuel_start + refueled - adj_norm_fuel, 2)
 
     text = (
         f"📊 <b>ИТОГ СМЕНЫ (Оренбург)</b>\n"
@@ -387,22 +449,30 @@ async def show_summary(msg: types.Message):
     )
     if odo_start is not None:
         text += f"• Начало: {odo_start:.0f} км\n"
-    text += f"• Расчёт (по вызовам): {calc_end:.0f} км\n"
+    text += f"• Расчёт (по вызовам): {calc_end} км\n"
     if odo_fact is not None:
         text += f"• Факт (введено): {odo_fact:.0f} км\n"
         sign = "+" if diff_km >= 0 else ""
-        text += f"• Разница: {sign}{diff_km:.1f} км (распределена)\n"
-        text += f"• Пробег по спидометру: {fact_total_km:.1f} км\n"
-    text += f"• Пробег по вызовам (расчёт): {calc_total_km:.1f} км\n\n"
+        text += f"• Разница: {sign}{diff_km} км (распределена)\n"
+        text += f"• Пробег по спидометру: {fact_total_km} км\n"
+    text += f"• Пробег по вызовам: {calls_km} км\n"
+    if cancelled_km > 0:
+        text += f"• Пробег по отменённым: {cancelled_km} км\n"
+    if pending > 0:
+        text += f"• Отложено км: {pending}\n"
+    text += "\n"
 
     text += (
         f"⛽ <b>ТОПЛИВО:</b>\n"
         f"• На старте: {fuel_start:.1f} л\n"
         f"• Заправок: +{refueled:.1f} л\n"
         f"• По норме ({norm} л/100км): {adj_norm_fuel:.2f} л\n"
-        f"• Остаток (расчёт): {fuel_end_calc:.1f} л\n\n"
-        f"🚑 Вызовов: {len(calls)}\n\n"
+        f"• Остаток (расчёт): {fuel_end_calc:.2f} л\n\n"
+        f"🚑 Вызовов: {len(calls)}\n"
     )
+    if cancelled:
+        text += f"❌ Отменённых: {len(cancelled)}\n"
+    text += "\n"
 
     text += (
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -412,15 +482,15 @@ async def show_summary(msg: types.Message):
         text += f"• Одометр начало: {odo_start:.0f} км\n"
     if odo_fact is not None:
         text += f"• Одометр конец: {odo_fact:.0f} км\n"
-        text += f"• Пробег: {fact_total_km:.1f} км\n"
+        text += f"• Пробег: {fact_total_km} км\n"
     else:
-        text += f"• Одометр конец (расчёт): {calc_end:.0f} км\n"
-        text += f"• Пробег (расчёт): {calc_total_km:.1f} км\n"
+        text += f"• Одометр конец (расчёт): {calc_end} км\n"
+        text += f"• Пробег (расчёт): {calc_total_km} км\n"
     text += (
         f"• Остаток при выезде: {fuel_start:.1f} л\n"
         f"• Заправок: +{refueled:.1f} л\n"
         f"• Расход по норме: {adj_norm_fuel:.2f} л\n"
-        f"• Остаток (расчёт): {fuel_end_calc:.1f} л\n"
+        f"• Остаток (расчёт): {fuel_end_calc:.2f} л\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
@@ -443,12 +513,23 @@ async def show_summary(msg: types.Message):
             route += " (без доставки)"
         adj = c.get("adjusted_km", c["total_km"])
         adj_f = c.get("adjusted_fuel", c.get("fuel_spent", 0))
+        pend_used = c.get("pending_used", 0)
         text += f"• №{c['number']} — {route}\n"
         text += f"   Принят: {accepted} | На адресе: {arrived}{delivery}\n"
-        if abs(adj - c["total_km"]) > 0.01:
-            text += f"   {c['total_km']:.1f} км → {adj:.1f} км, {adj_f:.2f} л\n"
+        if pend_used > 0:
+            text += f"   Свои: {c.get('own_km', 0)} км + отмена: {pend_used} км = {adj} км, {adj_f:.2f} л\n"
+        elif adj != c["total_km"]:
+            text += f"   {c['total_km']} км → {adj} км, {adj_f:.2f} л\n"
         else:
-            text += f"   {adj:.1f} км, {adj_f:.2f} л\n"
+            text += f"   {adj} км, {adj_f:.2f} л\n"
+
+    if cancelled:
+        text += f"\n❌ <b>ОТМЕНЁННЫЕ ВЫЗОВЫ (км ушли в следующий вызов):</b>\n"
+        for c in cancelled:
+            text += f"• №{c['number']} — {c['from_place']} → {c['address']}\n"
+            text += f"   Принят: {c['accepted']} | Отменён\n"
+            text += f"   {c['km']} км, {c['fuel_spent']:.2f} л\n"
+
     await msg.answer(text, parse_mode="HTML")
 
 @dp.message_handler(lambda m: m.text == "📊 Итог смены")
